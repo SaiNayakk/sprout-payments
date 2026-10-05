@@ -70,6 +70,8 @@ sprout:
     reconcile-after: 10s           # leave a payment alone this long before checking on it
     # How Sprout Bank reaches us with its callbacks.
     callback-url: ${PAYMENTS_CALLBACK_URL:http://127.0.0.1:8105/internal/v1/bank-events}
+    # Sprout services calling /internal/v1 (AutoPay debits, the spends feed) present this.
+    service-key: ${SPROUT_SERVICE_KEY:dev-only-service-key}
     accounts:
       url: ${PAYMENTS_ACCOUNTS_URL:http://127.0.0.1:8104}
       service-key: ${SPROUT_SERVICE_KEY:dev-only-service-key}

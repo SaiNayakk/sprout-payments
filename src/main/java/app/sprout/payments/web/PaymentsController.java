@@ -2,6 +2,9 @@ package app.sprout.payments.web;
 
 import app.sprout.payments.config.PaymentsProperties;
 import app.sprout.payments.domain.ApiException;
+import app.sprout.payments.domain.AutoPay;
+import app.sprout.payments.domain.AutoPay.Debit;
+import app.sprout.payments.domain.AutoPay.Mandate;
 import app.sprout.payments.domain.ErrorCode;
 import app.sprout.payments.domain.Money;
 import app.sprout.payments.domain.Payments;
@@ -16,6 +19,8 @@ import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -28,6 +33,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /** The payments API (payments-v1.yaml), plus the signed callback Sprout Bank calls. */
@@ -38,12 +44,18 @@ public class PaymentsController {
 
     public record MoneyRequest(String amount) {}
 
+    public record MandateRequest(String maxAmount) {}
+
+    public record DebitRequest(String userId, String amount, String reference, String description) {}
+
     private final Payments payments;
+    private final AutoPay autoPay;
     private final PaymentsProperties props;
     private final ObjectMapper json;
 
-    public PaymentsController(Payments payments, PaymentsProperties props, ObjectMapper json) {
+    public PaymentsController(Payments payments, AutoPay autoPay, PaymentsProperties props, ObjectMapper json) {
         this.payments = payments;
+        this.autoPay = autoPay;
         this.props = props;
         this.json = json;
     }
@@ -90,6 +102,58 @@ public class PaymentsController {
         return dto(payments.myWithdrawal(userId(user), id));
     }
 
+    // ── AutoPay ──────────────────────────────────────────────────────────────
+
+    @PostMapping("/v1/mandates")
+    public ResponseEntity<Map<String, Object>> setUpAutoPay(@RequestHeader(value = "X-User-Id", required = false) String user,
+                                                            @RequestHeader(value = "Idempotency-Key", required = false) String key,
+                                                            @RequestBody MandateRequest req) {
+        Created<Mandate> m = autoPay.setUp(userId(user), key, Money.paise(req.maxAmount()));
+        return ResponseEntity.status(m.created() ? HttpStatus.CREATED : HttpStatus.OK).body(dto(m.value()));
+    }
+
+    @GetMapping("/v1/mandates/me")
+    public Map<String, Object> myAutoPay(@RequestHeader(value = "X-User-Id", required = false) String user) {
+        return dto(autoPay.mine(userId(user)));
+    }
+
+    /** For Sprout services: a debit under the customer's AutoPay. An unknown outcome is a 503; repeating it is safe. */
+    @PostMapping("/internal/v1/mandate-debits")
+    public ResponseEntity<Map<String, Object>> debit(@RequestHeader(value = "X-Service-Key", required = false) String key,
+                                                     @RequestBody DebitRequest req) {
+        service(key);
+        if (req.userId() == null || req.reference() == null || req.reference().isBlank() || req.reference().length() > 120
+                || req.description() == null || req.description().isBlank()) {
+            throw new ApiException(ErrorCode.VALIDATION_FAILED, "Send userId, amount, reference (up to 120 characters) and description.");
+        }
+        Created<Debit> d;
+        try {
+            d = autoPay.debit(UUID.fromString(req.userId()), Money.paise(req.amount()), req.reference(), req.description());
+        } catch (Upstreams.Unreachable e) {
+            throw Upstreams.unavailable();
+        }
+        return ResponseEntity.status(d.created() ? HttpStatus.CREATED : HttpStatus.OK).body(dto(d.value()));
+    }
+
+    @GetMapping("/internal/v1/spends")
+    public Map<String, Object> spends(@RequestHeader(value = "X-Service-Key", required = false) String key,
+                                      @RequestParam(defaultValue = "0") long after, @RequestParam(defaultValue = "200") int limit) {
+        service(key);
+        if (after < 0 || limit < 1 || limit > 500) {
+            throw new ApiException(ErrorCode.VALIDATION_FAILED, "after is 0 or more; limit is 1 to 500.");
+        }
+        List<AutoPay.Spend> page = autoPay.spends(after, limit);
+        return Map.of("spends", page.stream().map(s -> Map.of("seq", s.seq(), "id", s.id().toString(), "userId", s.userId().toString(),
+                        "amount", Money.rupees(s.amount()), "payeeName", s.payeeName(), "at", s.at().toString())).toList(),
+                "next", page.isEmpty() ? after : page.get(page.size() - 1).seq());
+    }
+
+    private void service(String key) {
+        if (key == null || !MessageDigest.isEqual(key.getBytes(StandardCharsets.UTF_8), props.serviceKey().getBytes(StandardCharsets.UTF_8))) {
+            throw new ApiException(ErrorCode.UNAUTHENTICATED, "Only Sprout services can call this.");
+        }
+    }
+
     /** Sprout Bank's callback: verified, applied at most once, or refused with 503 so the bank retries. */
     @PostMapping("/internal/v1/bank-events")
     public ResponseEntity<Void> bankEvent(@RequestHeader(value = "X-Bank-Signature", required = false) String signature,
@@ -99,6 +163,15 @@ public class PaymentsController {
             throw new ApiException(ErrorCode.INVALID_SIGNATURE, "This doesn't carry Sprout Bank's signature.");
         }
         JsonNode e = json.readTree(body);
+        String type = e.path("type").asText();
+        if (type.startsWith("MANDATE_") || type.equals("SPEND")) {
+            payments.once(UUID.fromString(e.path("eventId").asText()), () -> autoPay.receive(type,
+                    UUID.fromString(e.path("mandateId").asText()), e.path("reference").asText(),
+                    e.hasNonNull("spendId") ? UUID.fromString(e.path("spendId").asText()) : null,
+                    e.hasNonNull("amount") ? Money.paise(e.path("amount").asText()) : 0, e.path("payeeName").asText(""),
+                    Instant.parse(e.path("occurredAt").asText())));
+            return ResponseEntity.noContent().build();
+        }
         try {
             payments.receive(UUID.fromString(e.path("eventId").asText()), e.path("type").asText(),
                     UUID.fromString(e.path("requestId").asText()), e.path("reference").asText(), Money.paise(e.path("amount").asText()));
@@ -137,6 +210,36 @@ public class PaymentsController {
         m.put("createdAt", d.createdAt().toString());
         m.put("updatedAt", d.updatedAt().toString());
         return m;
+    }
+
+    static Map<String, Object> dto(Mandate m) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("id", m.id().toString());
+        out.put("maxAmount", Money.rupees(m.maxAmount()));
+        out.put("status", m.status());
+        if (m.bankMandateId() != null) {
+            out.put("bankMandateId", m.bankMandateId().toString());
+        }
+        if (m.failureReason() != null) {
+            out.put("failureReason", m.failureReason());
+        }
+        out.put("createdAt", m.createdAt().toString());
+        out.put("updatedAt", m.updatedAt().toString());
+        return out;
+    }
+
+    static Map<String, Object> dto(Debit d) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("id", d.id().toString());
+        out.put("userId", d.userId().toString());
+        out.put("amount", Money.rupees(d.amount()));
+        out.put("reference", d.reference());
+        out.put("status", d.status());
+        if (d.failureReason() != null) {
+            out.put("failureReason", d.failureReason());
+        }
+        out.put("createdAt", d.createdAt().toString());
+        return out;
     }
 
     static Map<String, Object> dto(Withdrawal w) {

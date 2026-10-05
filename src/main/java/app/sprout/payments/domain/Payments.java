@@ -189,6 +189,15 @@ public class Payments {
         }
     }
 
+    /** Applies a bank event at most once: skipped if seen before, remembered once applied. */
+    public void once(UUID eventId, Runnable apply) {
+        if (db.sql("SELECT 1 FROM bank_events WHERE event_id = ?").param(eventId).query(Integer.class).optional().isPresent()) {
+            return;
+        }
+        apply.run();
+        remember(eventId);
+    }
+
     private void remember(UUID eventId) {
         db.sql("INSERT INTO bank_events (event_id, received_at) VALUES (?, ?) ON CONFLICT DO NOTHING")
                 .params(eventId, ts(clock.instant())).update();

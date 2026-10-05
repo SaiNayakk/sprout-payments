@@ -11,6 +11,7 @@ public record PaymentsProperties(
         Duration reconcileEvery,
         Duration reconcileAfter,
         String callbackUrl,
+        String serviceKey,
         Accounts accounts,
         Ledger ledger,
         Bank bank) {

@@ -72,6 +72,9 @@ class PaymentsApiTest {
     static final AtomicInteger PAYOUT_STATUS = new AtomicInteger(201);
     static final AtomicReference<String> COLLECT_STATUS = new AtomicReference<>("PENDING");
     static final Map<String, String> COLLECTS = new ConcurrentHashMap<>();       // request id -> amount
+    static final AtomicInteger DEBIT_STATUS = new AtomicInteger(201);
+    static final Map<String, String> DEBITS = new ConcurrentHashMap<>();         // bank reference -> amount (taken once)
+    static final String SERVICE_KEY = "dev-only-service-key";
     static final HttpServer UPSTREAMS = upstreams();
 
     @DynamicPropertySource
@@ -114,6 +117,7 @@ class PaymentsApiTest {
         LEDGER_DOWN.set(false);
         BANK_DOWN.set(false);
         PAYOUT_STATUS.set(201);
+        DEBIT_STATUS.set(201);
         COLLECT_STATUS.set("PENDING");
     }
 
@@ -299,6 +303,114 @@ class PaymentsApiTest {
                 .andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("NOT_FOUND"));
     }
 
+    // ── AutoPay ──────────────────────────────────────────────────────────────
+
+    JsonNode autoPay(String max) throws Exception {
+        return body(mvc.perform(post("/v1/mandates").header("X-User-Id", user.toString()).header("Idempotency-Key", UUID.randomUUID().toString())
+                .contentType(MediaType.APPLICATION_JSON).content("{\"maxAmount\":\"" + max + "\"}"))
+                .andExpect(status().isCreated()).andExpect(MATCHES_CONTRACT));
+    }
+
+    ResultActions mandateEvent(String type, JsonNode mandate, String eventId, Map<String, Object> extra) throws Exception {
+        Map<String, Object> e = new java.util.LinkedHashMap<>(Map.of("eventId", eventId, "type", type,
+                "mandateId", mandate.path("bankMandateId").asText(), "reference", mandate.path("id").asText(),
+                "occurredAt", "2026-10-05T04:00:00Z"));
+        e.putAll(extra);
+        String body = JSON.writeValueAsString(e);
+        return mvc.perform(post("/internal/v1/bank-events").contentType(MediaType.APPLICATION_JSON)
+                .header("X-Bank-Signature", "sha256=" + sign(body)).content(body));
+    }
+
+    JsonNode activeAutoPay(String max) throws Exception {
+        JsonNode m = autoPay(max);
+        mandateEvent("MANDATE_ACTIVE", m, UUID.randomUUID().toString(), Map.of()).andExpect(status().isNoContent());
+        return m;
+    }
+
+    ResultActions debit(String amount, String reference) throws Exception {
+        return mvc.perform(post("/internal/v1/mandate-debits").header("X-Service-Key", SERVICE_KEY).contentType(MediaType.APPLICATION_JSON)
+                .content(JSON.writeValueAsString(Map.of("userId", user.toString(), "amount", amount, "reference", reference,
+                        "description", "Round-ups into Goa trip"))));
+    }
+
+    @Test
+    void autoPayIsAskedOfTheBankAndActiveOnceTheCustomerApproves() throws Exception {
+        JsonNode m = autoPay("500.00");
+        assertThat(m.path("status").asText()).isEqualTo("AWAITING_APPROVAL");
+        assertThat(m.path("bankMandateId").asText()).isNotBlank();
+        String event = UUID.randomUUID().toString();
+        mandateEvent("MANDATE_ACTIVE", m, event, Map.of()).andExpect(status().isNoContent());
+        mvc.perform(get("/v1/mandates/me").header("X-User-Id", user.toString())).andExpect(status().isOk()).andExpect(MATCHES_CONTRACT)
+                .andExpect(jsonPath("$.status").value("ACTIVE"));
+        mandateEvent("MANDATE_REVOKED", m, UUID.randomUUID().toString(), Map.of()).andExpect(status().isNoContent());
+        mandateEvent("MANDATE_ACTIVE", m, event, Map.of()).andExpect(status().isNoContent());   // a replay changes nothing
+        mvc.perform(get("/v1/mandates/me").header("X-User-Id", user.toString())).andExpect(jsonPath("$.status").value("REVOKED"));
+    }
+
+    @Test
+    void aDebitUnderAutoPayCreditsTheBalanceOnce() throws Exception {
+        activeAutoPay("500.00");
+        String ref = "sweep-" + UUID.randomUUID();
+        JsonNode first = body(debit("150.00", ref).andExpect(status().isCreated()).andExpect(MATCHES_CONTRACT)
+                .andExpect(jsonPath("$.status").value("COMPLETED")));
+        debit("150.00", ref).andExpect(status().isOk()).andExpect(jsonPath("$.id").value(first.path("id").asText()));
+        assertThat(available()).isEqualTo("150.00");
+        assertThat(DEBITS).as("the bank was asked to take it once").containsKey(first.path("id").asText());
+        debit("500.01", "sweep-" + UUID.randomUUID()).andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("FAILED")).andExpect(jsonPath("$.failureReason").value("Above the AutoPay limit of ₹500.00."));
+        mvc.perform(post("/internal/v1/mandate-debits").contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void withoutActiveAutoPayNothingIsTaken() throws Exception {
+        debit("100.00", "sweep-" + UUID.randomUUID()).andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("FAILED")).andExpect(jsonPath("$.failureReason").value("No active AutoPay mandate."));
+        autoPay("500.00");   // asked, not yet approved
+        debit("100.00", "sweep-" + UUID.randomUUID()).andExpect(jsonPath("$.status").value("FAILED"));
+        assertThat(available()).isEqualTo("0.00");
+    }
+
+    @Test
+    void aDebitWithAnUnknownOutcomeIs503AndCompletesWhenRepeated() throws Exception {
+        activeAutoPay("500.00");
+        String ref = "sweep-" + UUID.randomUUID();
+        BANK_DOWN.set(true);
+        debit("200.00", ref).andExpect(status().isServiceUnavailable());
+        BANK_DOWN.set(false);
+        debit("200.00", ref).andExpect(status().isOk()).andExpect(jsonPath("$.status").value("COMPLETED"));
+        assertThat(available()).isEqualTo("200.00");
+    }
+
+    @Test
+    void aDebitTheBankRefusesFailsWithTheReason() throws Exception {
+        activeAutoPay("500.00");
+        DEBIT_STATUS.set(422);
+        debit("200.00", "sweep-" + UUID.randomUUID()).andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("FAILED")).andExpect(jsonPath("$.failureReason").value("Not enough money in your bank account."));
+        assertThat(available()).isEqualTo("0.00");
+    }
+
+    @Test
+    void sharedSpendsAreReadInOrderOnce() throws Exception {
+        JsonNode m = activeAutoPay("500.00");
+        long start = JSON.readTree(mvc.perform(get("/internal/v1/spends?after=0&limit=500").header("X-Service-Key", SERVICE_KEY))
+                .andReturn().getResponse().getContentAsString()).path("next").asLong();
+        String chai = UUID.randomUUID().toString();
+        mandateEvent("SPEND", m, UUID.randomUUID().toString(), Map.of("spendId", chai, "amount", "46.00", "payeeName", "Monsoon Chai"))
+                .andExpect(status().isNoContent());
+        mandateEvent("SPEND", m, UUID.randomUUID().toString(), Map.of("spendId", chai, "amount", "46.00", "payeeName", "Monsoon Chai"))
+                .andExpect(status().isNoContent());   // the same spend told twice
+        mandateEvent("SPEND", m, UUID.randomUUID().toString(), Map.of("spendId", UUID.randomUUID().toString(), "amount", "143.50",
+                "payeeName", "Tiffin Box Kitchen")).andExpect(status().isNoContent());
+        JsonNode page = body(mvc.perform(get("/internal/v1/spends?after=" + start).header("X-Service-Key", SERVICE_KEY))
+                .andExpect(status().isOk()).andExpect(MATCHES_CONTRACT));
+        assertThat(page.path("spends").findValuesAsText("payeeName")).containsExactly("Monsoon Chai", "Tiffin Box Kitchen");
+        assertThat(page.path("spends").get(0).path("userId").asText()).isEqualTo(user.toString());
+        JsonNode rest = body(mvc.perform(get("/internal/v1/spends?after=" + page.path("next").asLong()).header("X-Service-Key", SERVICE_KEY)));
+        assertThat(rest.path("spends")).isEmpty();
+    }
+
     // ── stand-ins ────────────────────────────────────────────────────────────
 
     static String sign(String body) throws Exception {
@@ -389,6 +501,25 @@ class PaymentsApiTest {
                     String id = ex.getRequestURI().getPath().substring("/partner/v1/collect-requests/".length());
                     reply(ex, 200, Map.of("id", id, "status", COLLECT_STATUS.get(), "amount", COLLECTS.getOrDefault(id, "0")));
                 }
+            });
+            s.createContext("/partner/v1/mandates", ex -> {
+                if (BANK_DOWN.get()) {
+                    reply(ex, 503, null);
+                    return;
+                }
+                String path = ex.getRequestURI().getPath();
+                if (path.endsWith("/debits")) {
+                    JsonNode req = JSON.readTree(ex.getRequestBody());
+                    int st = DEBIT_STATUS.get();
+                    if (st / 100 == 2) {
+                        DEBITS.putIfAbsent(req.path("reference").asText(), req.path("amount").asText());
+                        reply(ex, st, Map.of("id", UUID.randomUUID().toString(), "status", "COMPLETED"));
+                    } else {
+                        reply(ex, st, Map.of("code", "INSUFFICIENT_BALANCE"));
+                    }
+                    return;
+                }
+                reply(ex, 201, Map.of("id", UUID.randomUUID().toString(), "status", "PENDING"));
             });
             s.createContext("/partner/v1/payouts", ex -> {
                 if (BANK_DOWN.get()) {
