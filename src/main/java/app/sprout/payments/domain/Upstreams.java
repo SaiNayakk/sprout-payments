@@ -46,8 +46,10 @@ public class Upstreams {
     private final PaymentsProperties props;
     private final ObjectMapper json;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
+    private final Onward onward;
 
-    public Upstreams(PaymentsProperties props, ObjectMapper json) {
+    public Upstreams(PaymentsProperties props, ObjectMapper json, Onward onward) {
+        this.onward = onward;
         this.props = props;
         this.json = json;
     }
@@ -112,6 +114,7 @@ public class Upstreams {
     // ── plumbing ─────────────────────────────────────────────────────────────
 
     private Reply send(String what, HttpRequest.Builder req) {
+        onward.headers(req);
         try {
             HttpResponse<String> res = http.send(req.timeout(Duration.ofSeconds(3)).build(), HttpResponse.BodyHandlers.ofString());
             if (res.statusCode() >= 500) {
