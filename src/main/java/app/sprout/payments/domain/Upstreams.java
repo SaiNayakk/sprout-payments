@@ -104,6 +104,21 @@ public class Upstreams {
                 .header("X-Partner-Key", props.bank().partnerKey()).GET());
     }
 
+    public Reply requestMandate(String payerVpa, long maxPaise, String purpose, String reference) {
+        Map<String, Object> body = Map.of("payerVpa", payerVpa, "maxAmount", Money.rupees(maxPaise), "purpose", purpose, "reference", reference,
+                "shareSpends", true, "callbackUrl", props.callbackUrl());
+        return send("bank", HttpRequest.newBuilder(URI.create(props.bank().url() + "/partner/v1/mandates"))
+                .header("Content-Type", "application/json").header("X-Partner-Key", props.bank().partnerKey())
+                .POST(HttpRequest.BodyPublishers.ofString(write(body))));
+    }
+
+    public Reply debitMandate(UUID bankMandateId, long paise, String reference) {
+        Map<String, Object> body = Map.of("amount", Money.rupees(paise), "reference", reference);
+        return send("bank", HttpRequest.newBuilder(URI.create(props.bank().url() + "/partner/v1/mandates/" + bankMandateId + "/debits"))
+                .header("Content-Type", "application/json").header("X-Partner-Key", props.bank().partnerKey())
+                .POST(HttpRequest.BodyPublishers.ofString(write(body))));
+    }
+
     public Reply payout(String payeeVpa, long paise, String reference) {
         Map<String, Object> body = Map.of("payeeVpa", payeeVpa, "amount", Money.rupees(paise), "reference", reference);
         return send("bank", HttpRequest.newBuilder(URI.create(props.bank().url() + "/partner/v1/payouts"))

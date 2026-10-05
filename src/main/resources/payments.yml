@@ -47,8 +47,10 @@ management:
         step: 15s
     tracing:
       endpoint: ${OTEL_TRACES_URL:http://localhost:4318/v1/traces}
+      export:
+        enabled: ${OTEL_ENABLED:false}   # send traces to a collector only when one runs
   tracing:
-    enabled: ${OTEL_ENABLED:false}
+    enabled: true   # always carry the trace onward (W3C traceparent), even when nothing collects it
     sampling:
       probability: 1.0
   metrics:
@@ -70,6 +72,8 @@ sprout:
     reconcile-after: 10s           # leave a payment alone this long before checking on it
     # How Sprout Bank reaches us with its callbacks.
     callback-url: ${PAYMENTS_CALLBACK_URL:http://127.0.0.1:8105/internal/v1/bank-events}
+    # Sprout services calling /internal/v1 (AutoPay debits, the spends feed) present this.
+    service-key: ${SPROUT_SERVICE_KEY:dev-only-service-key}
     accounts:
       url: ${PAYMENTS_ACCOUNTS_URL:http://127.0.0.1:8104}
       service-key: ${SPROUT_SERVICE_KEY:dev-only-service-key}
